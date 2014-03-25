@@ -30,9 +30,12 @@ int num_threads();
 
 // The SEE implementations work in long-sized chunks
 typedef const unsigned long chunk_t;
+typedef const unsigned long long double_chunk_t;
 const static int chunk_size = sizeof(chunk_t);
+const static int double_chunk_size = sizeof(double_chunk_t);
 // A function to calculate the bits set for a single chunk
 typedef long kernel_func(chunk_t _chunk);
+typedef long kernel_func2(double_chunk_t _chunk);
 
 #define B1 (~(chunk_t)0/3)
 #define B2 (~(chunk_t)0/15*3)
@@ -112,6 +115,77 @@ long count_bits_kernel(const uchar *buffer, size_t bufsize)
     return total;
 }
 
+// Count the bits by interating in word-sized chunks and
+// using a kernel function that operates on words.
+// Then, get the leftover bytes using the naive one-byte-at-a-time method.
+template <kernel_func2 func>
+long count_bits_kernel_double(const uchar *buffer, size_t bufsize)
+{
+    long total = 0;
+    const long num_chunks = bufsize / double_chunk_size;
+    const size_t chunked_bufsize = num_chunks * double_chunk_size;
+    const int leftover = bufsize - chunked_bufsize;
+
+#pragma omp parallel reduction (+:total)
+    {
+        long thread_total = 0;
+
+#pragma omp for
+        for (long i = 0; i < num_chunks; i++)
+        {
+            double_chunk_t chunk = *reinterpret_cast<double_chunk_t *>(buffer + i * double_chunk_size);
+            thread_total += func(chunk);
+        }
+
+        total += thread_total;
+    }
+
+    total += count_bits_naive(buffer + chunked_bufsize, leftover);
+    return total;
+}
+
+
+// Count the bits by interating in word-sized chunks and
+// using a kernel function that operates on words.
+// Then, get the leftover bytes using the naive one-byte-at-a-time method.
+template <kernel_func func, kernel_func func2, int numFunc1, int numFunc2>
+long count_bits_kernel2(const uchar *buffer, size_t bufsize)
+{
+    long total = 0;
+    const long num_chunks = bufsize / chunk_size;
+    const size_t chunked_bufsize = num_chunks * chunk_size;
+    const int leftover = bufsize - chunked_bufsize;
+
+#pragma omp parallel reduction (+:total)
+    {
+        long thread_total = 0;
+        int thread_id = omp_get_thread_num();
+        int num_threads = omp_get_num_threads();
+
+        if (thread_id < num_threads / (numFunc1 + numFunc2)) {
+#pragma omp for
+          for (long i = 0; i < num_chunks; i++)
+          {
+            chunk_t chunk = *reinterpret_cast<chunk_t *>(buffer + i * chunk_size);
+            thread_total += func(chunk);
+          }
+        } else {
+#pragma omp for
+          for (long i = 0; i < num_chunks; i++)
+          {
+            chunk_t chunk = *reinterpret_cast<chunk_t *>(buffer + i * chunk_size);
+            thread_total += func2(chunk);
+          }
+        }
+
+        total += thread_total;
+    }
+
+    total += count_bits_naive(buffer + chunked_bufsize, leftover);
+    return total;
+}
+
+
 // Count the bits using static lookup table
 inline long table_kernel(chunk_t chunk)
 {
@@ -156,7 +230,6 @@ long count_bits_sidewaysaddition(const uchar *buffer, size_t buffsize)
     return count_bits_kernel<sidewaysaddition_kernel>(buffer, buffsize);
 }
 
-
 inline long intrinsic_kernel(chunk_t chunk)
 {
     return __builtin_popcountl(chunk);
@@ -167,6 +240,25 @@ long count_bits_intrinsic(const uchar *buffer, size_t bufsize)
 {
     return count_bits_kernel<intrinsic_kernel>(buffer, bufsize);
 }
+
+
+inline long intrinsic_kernel_double(double_chunk_t chunk)
+{
+    return __builtin_popcountll(chunk);
+}
+
+// Count the bits using POPCNT instrinsic
+long count_bits_intrinsic_double(const uchar *buffer, size_t bufsize)
+{
+    return count_bits_kernel_double<intrinsic_kernel_double>(buffer, bufsize);
+}
+
+// Count the bits using both POPCNT instrinsic and sideways addition
+long count_bits_optimized(const uchar *buffer, size_t bufsize)
+{
+    return count_bits_kernel2<intrinsic_kernel, sidewaysaddition_kernel, 1, 1>(buffer, bufsize);
+}
+
 
 // Count the bits using inline ASM with POPCNT
 long count_bits_asm(const uchar *buffer, size_t bufsize)
@@ -330,7 +422,7 @@ int main(int argc, char **argv)
         cerr << "Usage: " << argv[0] << " <megs of data>" << endl;
         return -1;
     }
-    cout << "Using " << megs_of_data << " megs of data. wordsize: " << sizeof(chunk_t) << endl;
+    cout << "Using " << megs_of_data << " megs of data. wordsize: " << chunk_size << " double wordsize: " << double_chunk_size << endl;
     size_t bufsize = megs_of_data * 1024 * 1024;
 
 
@@ -359,6 +451,8 @@ int main(int argc, char **argv)
     }
     time_bit_counting("Intrinsic implementation (serial)",
                       count_bits_intrinsic, buffer, bufsize);
+    time_bit_counting("Intrinsic implementation double (serial)",
+                      count_bits_intrinsic_double, buffer, bufsize);
     time_bit_counting("ASM implementation (serial)",
                       count_bits_asm, buffer, bufsize);
     time_bit_counting("Sideways Addition (serial)",
@@ -376,10 +470,14 @@ int main(int argc, char **argv)
                           count_bits_table, buffer, bufsize, kernel_iters);
         time_bit_counting("Intrinsic implementation (parallel)",
                           count_bits_intrinsic, buffer, bufsize);
+        time_bit_counting("Intrinsic implementation double (parallel)",
+                          count_bits_intrinsic_double, buffer, bufsize);
         time_bit_counting("ASM implementation (parallel)",
                           count_bits_asm, buffer, bufsize);
         time_bit_counting("Sideways Addition (parallel)",
                           count_bits_sidewaysaddition, buffer, bufsize);
+        time_bit_counting("Optimized hyperthread (parallel)",
+                          count_bits_optimized, buffer, bufsize);
     }
 
     delete [] original_buffer;
