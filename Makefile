@@ -1,5 +1,5 @@
 CC=g++
-CFLAGS=-Wall -Werror -O3 -march=barcelona -fopenmp -lgomp
+CFLAGS=-Wall -Werror -O3 -march=native -fopenmp -lgomp -I$(BOOST_DIR)/include
 EXECUTABLE=./count_bits
 
 $(EXECUTABLE): count_bits.cpp
