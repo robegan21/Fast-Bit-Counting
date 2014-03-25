@@ -3,6 +3,10 @@
 #include <iostream>
 #include <fstream>
 
+#include "boost/date_time/posix_time/posix_time.hpp" 
+#include "boost/random/mersenne_twister.hpp"
+#include "boost/random/uniform_int_distribution.hpp"
+
 using namespace std;
 
 typedef unsigned char uchar;
@@ -15,9 +19,9 @@ typedef long bit_counting_function(const uchar *buffer, size_t bufsize);
 bit_counting_function count_bits_naive; // Use simple C loop per bit
 bit_counting_function count_bits_table; // Use simple C loop per byte, via a lookup table
 bit_counting_function count_bits_kernighan; // Brian Kernighan's method
+bit_counting_function count_bits_sidewaysaddition; // using magic binary numbers: http://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetTable
 bit_counting_function count_bits_intrinsic; // Use POPCNT intrinsic
 bit_counting_function count_bits_asm; // Inline ASM loop with POPCNT
-
 
 // Utility functions for implementations
 long count_bits_asm_chunked(const uchar *buffer, size_t bufsize);
@@ -29,6 +33,24 @@ typedef const unsigned long chunk_t;
 const static int chunk_size = sizeof(chunk_t);
 // A function to calculate the bits set for a single chunk
 typedef long kernel_func(chunk_t _chunk);
+
+#define B1 (~(chunk_t)0/3)
+#define B2 (~(chunk_t)0/15*3)
+#define B3 (~(chunk_t)0/255*15)
+#define B4 (~(chunk_t)0/255)
+#define S1 ((sizeof(chunk_t) - 1) * 8)
+#define _CBITSa(val) \
+                val = val - ((val >> 1) & B1);
+#define _CBITSb(val) \
+                val = (val & B2) + ((val >> 2) & B2);
+#define _CBITSc(val) \
+                val = (val + (val >> 4)) & B3;
+#define _CBITS(val) \
+        _CBITSa(val) _CBITSb(val) _CBITSc(val)
+
+#define _CBITS2(val) (((chunk_t)(val * B4)) >> S1)
+
+
 
 // How may trials to use for timing the slow and fast implementations
 const int naive_iters = 10;
@@ -120,6 +142,18 @@ inline long kernighan_kernel(chunk_t _chunk)
 long count_bits_kernighan(const uchar *buffer, size_t bufsize)
 {
     return count_bits_kernel<kernighan_kernel>(buffer, bufsize);
+}
+
+inline long sidewaysaddition_kernel(chunk_t _chunk)
+{
+    long chunk = _chunk;
+    _CBITS(chunk);
+    return _CBITS2(chunk);
+}
+
+long count_bits_sidewaysaddition(const uchar *buffer, size_t buffsize)
+{
+    return count_bits_kernel<sidewaysaddition_kernel>(buffer, buffsize);
 }
 
 
@@ -230,7 +264,7 @@ void time_bit_counting(const char *description, bit_counting_function *func, con
         ten_percent = 1;
 
     cout << endl << description;
-    const time_t start = time(NULL);
+    const boost::posix_time::ptime start = boost::posix_time::microsec_clock::local_time();
     for (int i = 0; i < iters; i++)
     {
         long num_bits = func(buffer, bufsize);
@@ -239,9 +273,46 @@ void time_bit_counting(const char *description, bit_counting_function *func, con
         else if (! (i % ten_percent))
             cout << ".";
     }
-    const time_t duration = time(NULL) - start;
+    const boost::posix_time::ptime end = boost::posix_time::microsec_clock::local_time();
+    const double duration = (end-start).total_microseconds() / 1000000.0;
     cout << endl << ((double)duration / iters) << " seconds per iteration" << endl;
 }
+
+uchar * init_buffer(long bufsize) {
+
+    uchar *buffer = new unsigned char[bufsize];
+
+    // Use /dev/urandom intead of /dev/random because
+    // the latter may block if we try to read too much
+    cout << "Generating random input... ";
+#pragma omp parallel
+    {
+        int num_threads = omp_get_num_threads();
+        int thread_id = omp_get_thread_num();
+
+        long myBuffSize = bufsize / num_threads;
+        ifstream infile("/dev/urandom", ios::binary);
+        long myseed;
+        infile.read((char*) &myseed, sizeof(myseed));
+        infile.close();
+        boost::random::mt11213b rng(myseed);
+        boost::random::uniform_int_distribution<long> dist;
+
+	long *myBuf = (long*) (buffer + myBuffSize * thread_id);
+	long *myEnd = (long*) (buffer + myBuffSize * (thread_id+1));
+        if (thread_id == num_threads-1) {
+            myEnd = (long*) (buffer + bufsize);
+        }
+        while(myBuf != myEnd) {
+            *myBuf++ = dist(rng);
+        }
+    }
+    cout << "done." << endl;
+
+    return buffer;
+
+}
+
 
 int main(int argc, char **argv)
 {
@@ -259,23 +330,17 @@ int main(int argc, char **argv)
         cerr << "Usage: " << argv[0] << " <megs of data>" << endl;
         return -1;
     }
-    cout << "Using " << megs_of_data << " megs of data" << endl;
+    cout << "Using " << megs_of_data << " megs of data. wordsize: " << sizeof(chunk_t) << endl;
     size_t bufsize = megs_of_data * 1024 * 1024;
-    uchar *buffer = new unsigned char[bufsize];
+
+
+    uchar *original_buffer = init_buffer(bufsize);
 
     // Let's make the data unaligned so it's even harder for SSE
     // who sometimes cares about such things
-    uchar *original_buffer = buffer;
-    buffer += 1;
-    bufsize -= 1;
-
-    // Use /dev/urandom intead of /dev/random because
-    // the latter may block if we try to read too much
-    ifstream infile("/dev/urandom", ios::binary);
-    cout << "Reading input... ";
-    infile.read(reinterpret_cast<char*>(buffer), bufsize);
-    cout << "done." << endl;
-    infile.close();
+    uchar *buffer = original_buffer;
+//    buffer += 1;
+//    bufsize -= 1;
 
     init_lookup_table();
 
@@ -285,15 +350,20 @@ int main(int argc, char **argv)
     // Turn off parallelism
     int original_n_threads = num_threads();
     omp_set_num_threads(1);
+    if (original_n_threads < 4) {
 
-    time_bit_counting("Brian Kernighan's method (serial)",
-                      count_bits_kernighan, buffer, bufsize, kernel_iters);
-    time_bit_counting("Lookup table implementation (serial)",
-                      count_bits_table, buffer, bufsize, kernel_iters);
+        time_bit_counting("Brian Kernighan's method (serial)",
+                          count_bits_kernighan, buffer, bufsize, kernel_iters);
+        time_bit_counting("Lookup table implementation (serial)",
+                          count_bits_table, buffer, bufsize, kernel_iters);
+    }
     time_bit_counting("Intrinsic implementation (serial)",
                       count_bits_intrinsic, buffer, bufsize);
     time_bit_counting("ASM implementation (serial)",
                       count_bits_asm, buffer, bufsize);
+    time_bit_counting("Sideways Addition (serial)",
+                      count_bits_sidewaysaddition, buffer, bufsize);
+    
 
     if (original_n_threads > 1)
     {
@@ -308,6 +378,8 @@ int main(int argc, char **argv)
                           count_bits_intrinsic, buffer, bufsize);
         time_bit_counting("ASM implementation (parallel)",
                           count_bits_asm, buffer, bufsize);
+        time_bit_counting("Sideways Addition (parallel)",
+                          count_bits_sidewaysaddition, buffer, bufsize);
     }
 
     delete [] original_buffer;
